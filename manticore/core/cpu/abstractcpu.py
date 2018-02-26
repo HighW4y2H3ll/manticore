@@ -1,6 +1,7 @@
 import inspect
 import logging
 import StringIO
+import string
 import sys
 import types
 
@@ -8,6 +9,7 @@ from functools import wraps
 from itertools import islice, imap
 
 import capstone as cs
+import unicorn
 
 from .disasm import init_disassembler
 from ..smtlib import Expression, Bool, BitVec, Array, Operators, Constant
@@ -18,8 +20,8 @@ from ...utils.helpers import issymbolic
 from ...utils.emulate import UnicornEmulator
 from ...utils.event import Eventful
 
-logger = logging.getLogger("CPU")
-register_logger = logging.getLogger("REGISTERS")
+logger = logging.getLogger(__name__)
+register_logger = logging.getLogger('{}.registers'.format(__name__))
 
 ###################################################################################
 #Exceptions
@@ -39,6 +41,12 @@ class InstructionNotImplementedError(CpuException):
     '''
     Exception raised when you try to execute an instruction that is not yet
     implemented in the emulator. Add it to the Cpu-specific implementation.
+    '''
+    pass
+
+class InstructionEmulationError(CpuException):
+    '''
+    Exception raised when failing to emulate an instruction outside of Manticore.
     '''
     pass
 
@@ -268,20 +276,16 @@ class Abi(object):
             yield base
             base += word_bytes
 
-    def invoke(self, model, prefix_args=None):
+    def get_argument_values(self, model, prefix_args):
         '''
-        Invoke a callable `model` as if it was a native function. If
-        :func:`~manticore.models.isvariadic` returns true for `model`, `model` receives a single
-        argument that is a generator for function arguments. Pass a tuple of
-        arguments for `prefix_args` you'd like to precede the actual
-        arguments.
+        Extract arguments for model from the environment and return as a tuple that
+        is ready to be passed to the model.
 
         :param callable model: Python model of the function
         :param tuple prefix_args: Parameters to pass to model before actual ones
-        :return: The result of calling `model`
+        :return: Arguments to be passed to the model
+        :rtype: tuple
         '''
-        prefix_args = prefix_args or ()
-
         spec = inspect.getargspec(model)
 
         if spec.varargs:
@@ -306,12 +310,31 @@ class Abi(object):
         # TODO(mark) this is here as a hack to avoid circular import issues
         from ...models import isvariadic
 
+        if isvariadic(model):
+            arguments = prefix_args + (argument_iter,)
+        else:
+            arguments = prefix_args + tuple(islice(argument_iter, nargs))
+
+        return arguments
+
+    def invoke(self, model, prefix_args=None):
+        '''
+        Invoke a callable `model` as if it was a native function. If
+        :func:`~manticore.models.isvariadic` returns true for `model`, `model` receives a single
+        argument that is a generator for function arguments. Pass a tuple of
+        arguments for `prefix_args` you'd like to precede the actual
+        arguments.
+
+        :param callable model: Python model of the function
+        :param tuple prefix_args: Parameters to pass to model before actual ones
+        :return: The result of calling `model`
+        '''
+        prefix_args = prefix_args or ()
+
+        arguments = self.get_argument_values(model, prefix_args)
+
         try:
-            if isvariadic(model):
-                result = model(*(prefix_args + (argument_iter,)))
-            else:
-                argument_tuple = prefix_args + tuple(islice(argument_iter, nargs))
-                result = model(*argument_tuple)
+            result = model(*arguments)
         except ConcretizeArgument as e:
             assert e.argnum >= len(prefix_args), "Can't concretize a constant arg"
             idx = e.argnum - len(prefix_args)
@@ -333,10 +356,15 @@ class Abi(object):
 
         return result
 
+platform_logger = logging.getLogger('manticore.platforms.platform')
+
 class SyscallAbi(Abi):
     '''
     A system-call specific ABI.
+
+    Captures model arguments and return values for centralized logging.
     '''
+
     def syscall_number(self):
         '''
         Extract the index of the invoked syscall.
@@ -344,6 +372,42 @@ class SyscallAbi(Abi):
         :return: int
         '''
         raise NotImplementedError
+
+    def get_argument_values(self, model, prefix_args):
+        self._last_arguments = super(SyscallAbi, self).get_argument_values(model, prefix_args)
+        return self._last_arguments
+
+    def invoke(self, model, prefix_args=None):
+        # invoke() will call get_argument_values()
+        self._last_arguments = ()
+
+        ret = super(SyscallAbi, self).invoke(model, prefix_args)
+
+        if platform_logger.isEnabledFor(logging.DEBUG):
+            # Try to expand strings up to max_arg_expansion
+            max_arg_expansion = 32
+            # Add a hex representation to return if greater than min_hex_expansion
+            min_hex_expansion = 0x80
+
+            args = []
+            for arg in self._last_arguments:
+                arg_s = "0x{:x}".format(arg)
+                if self._cpu.memory.access_ok(arg, 'r'):
+                    s = self._cpu.read_string(arg, max_arg_expansion)
+                    if all(c in string.printable for c in s):
+                        if len(s) == max_arg_expansion:
+                            s = s + '..'
+                        if len(s) > 2:
+                            arg_s = arg_s + ' ({})'.format(s.translate(None, '\n'))
+                args.append(arg_s)
+
+            args_s = ', '.join(args)
+
+            ret_s = '{}'.format(ret)
+            if ret > min_hex_expansion:
+                ret_s = ret_s + '(0x{:x})'.format(ret)
+
+            platform_logger.debug('%s(%s) -> %s', model.im_func.func_name, args_s, ret_s)
 
 ############################################################################
 # Abstract cpu encapsulating common cpu methods used by platforms and executor.
@@ -362,6 +426,9 @@ class Cpu(Eventful):
     - pc_alias
     - stack_alias
     '''
+
+    _published_events = {'write_register', 'read_register', 'write_memory', 'read_memory', 'decode_instruction',
+                           'execute_instruction'}
 
     def __init__(self, regfile, memory, **kwargs):
         assert isinstance(regfile, RegisterFile)
@@ -437,9 +504,9 @@ class Cpu(Eventful):
         :param value: register value
         :type value: int or long or Expression
         '''
-        self.publish('will_write_register', register, value)
+        self._publish('will_write_register', register, value)
         value = self._regfile.write(register, value)
-        self.publish('did_write_register', register, value)
+        self._publish('did_write_register', register, value)
         return value
 
     def read_register(self, register):
@@ -450,9 +517,9 @@ class Cpu(Eventful):
         :return: register value
         :rtype: int or long or Expression
         '''
-        self.publish('will_read_register', register)
+        self._publish('will_read_register', register)
         value = self._regfile.read(register)
-        self.publish('did_read_register', register, value)
+        self._publish('did_read_register', register, value)
         return value
 
     # Pythonic access to registers and aliases
@@ -486,7 +553,7 @@ class Cpu(Eventful):
     def memory(self):
         return self._memory
 
-    def write_int(self, where, expression, size=None):
+    def write_int(self, where, expression, size=None, force=False):
         '''
         Writes int to memory
 
@@ -494,18 +561,20 @@ class Cpu(Eventful):
         :param expr: value to write
         :type expr: int or BitVec
         :param size: bit size of `expr`
+        :param force: whether to ignore memory permissions
         '''
         if size is None:
             size = self.address_bit_size
         assert size in SANE_SIZES
-        self.publish('will_write_memory', where, expression, size)
+        self._publish('will_write_memory', where, expression, size)
 
-        self.memory[where:where+size/8] = [Operators.CHR(Operators.EXTRACT(expression, offset, 8)) for offset in xrange(0, size, 8)]
+        data = [Operators.CHR(Operators.EXTRACT(expression, offset, 8)) for offset in xrange(0, size, 8)]
+        self._memory.write(where, data, force)
 
-        self.publish('did_write_memory', where, expression, size)
+        self._publish('did_write_memory', where, expression, size)
 
 
-    def read_int(self, where, size=None):
+    def read_int(self, where, size=None, force=False):
         '''
         Reads int from memory
 
@@ -513,46 +582,49 @@ class Cpu(Eventful):
         :param size: number of bits to read
         :return: the value read
         :rtype: int or BitVec
+        :param force: whether to ignore memory permissions
         '''
         if size is None:
             size = self.address_bit_size
         assert size in SANE_SIZES
-        self.publish('will_read_memory', where, size)
+        self._publish('will_read_memory', where, size)
 
-        data = self.memory[where:where + size / 8]
+        data = self._memory.read(where, size/8, force)
         assert (8 * len(data)) == size
         value = Operators.CONCAT(size, *map(Operators.ORD, reversed(data)))
 
-        self.publish('did_read_memory', where, value, size)
+        self._publish('did_read_memory', where, value, size)
         return value
 
 
-    def write_bytes(self, where, data):
+    def write_bytes(self, where, data, force=False):
         '''
         Write a concrete or symbolic (or mixed) buffer to memory
 
         :param int where: address to write to
         :param data: data to write
         :type data: str or list
+        :param force: whether to ignore memory permissions
         '''
         for i in xrange(len(data)):
-            self.write_int(where + i, Operators.ORD(data[i]), 8)
+            self.write_int(where + i, Operators.ORD(data[i]), 8, force)
 
-    def read_bytes(self, where, size):
+    def read_bytes(self, where, size, force=False):
         '''
         Read from memory.
 
         :param int where: address to read data from
         :param int size: number of bytes
+        :param force: whether to ignore memory permissions
         :return: data
         :rtype: list[int or Expression]
         '''
         result = []
         for i in xrange(size):
-            result.append(Operators.CHR(self.read_int(where + i, 8)))
+            result.append(Operators.CHR(self.read_int(where + i, 8, force)))
         return result
 
-    def write_string(self, where, string, max_length=None):
+    def write_string(self, where, string, max_length=None, force=False):
         '''
         Writes a string to memory, appending a NULL-terminator at the end.
         :param int where: Address to write the string to
@@ -560,31 +632,31 @@ class Cpu(Eventful):
         :param int max_length:
             The size in bytes to cap the string at, or None [default] for no
             limit. This includes the NULL terminator.
+        :param force: whether to ignore memory permissions
         '''
         
         if max_length is not None:
             string = string[:max_length-1]
         
-        self.write_bytes(where, string + '\x00')
+        self.write_bytes(where, string + '\x00', force)
         
-    def read_string(self, where, max_length=None):
+    def read_string(self, where, max_length=None, force=False):
         '''
-        Read a NUL-terminated concrete buffer from memory.
+        Read a NUL-terminated concrete buffer from memory. Stops reading at first symbolic byte.
 
         :param int where: Address to read string from
         :param int max_length:
             The size in bytes to cap the string at, or None [default] for no
             limit.
+        :param force: whether to ignore memory permissions
         :return: string read
         :rtype: str
         '''
         s = StringIO.StringIO()
         while True:
-            c = self.read_int(where, 8)
+            c = self.read_int(where, 8, force)
 
-            assert not issymbolic(c)
-
-            if c == 0:
+            if issymbolic(c) or c == 0:
                 break
 
             if max_length is not None:
@@ -595,46 +667,50 @@ class Cpu(Eventful):
             where += 1
         return s.getvalue()
 
-    def push_bytes(self, data):
+    def push_bytes(self, data, force=False):
         '''
         Write `data` to the stack and decrement the stack pointer accordingly.
 
         :param str data: Data to write
+        :param force: whether to ignore memory permissions
         '''
         self.STACK -= len(data)
-        self.write_bytes(self.STACK, data)
+        self.write_bytes(self.STACK, data, force)
         return self.STACK
 
-    def pop_bytes(self, nbytes):
+    def pop_bytes(self, nbytes, force=False):
         '''
         Read `nbytes` from the stack, increment the stack pointer, and return
         data.
 
         :param int nbytes: How many bytes to read
+        :param force: whether to ignore memory permissions
         :return: Data read from the stack
         '''
-        data = self.read_bytes(self.STACK, nbytes)
+        data = self.read_bytes(self.STACK, nbytes, force=force)
         self.STACK += nbytes
         return data
 
-    def push_int(self, value):
+    def push_int(self, value, force=False):
         '''
         Decrement the stack pointer and write `value` to the stack.
 
         :param int value: The value to write
+        :param force: whether to ignore memory permissions
         :return: New stack pointer
         '''
         self.STACK -= self.address_bit_size / 8
-        self.write_int(self.STACK, value)
+        self.write_int(self.STACK, value, force=force)
         return self.STACK
 
-    def pop_int(self):
+    def pop_int(self, force=False):
         '''
         Read a value from the stack and increment the stack pointer.
 
+        :param force: whether to ignore memory permissions
         :return: Value read
         '''
-        value = self.read_int(self.STACK)
+        value = self.read_int(self.STACK, force=force)
         self.STACK += self.address_bit_size / 8
         return value
 
@@ -727,39 +803,47 @@ class Cpu(Eventful):
         if not self.memory.access_ok(self.PC, 'x'):
             raise InvalidMemoryAccess(self.PC, 'x')
 
-        self.publish('will_decode_instruction', self.PC)
+        self._publish('will_decode_instruction', self.PC)
 
         insn = self.decode_instruction(self.PC)
         self._last_pc = self.PC
 
-        self.publish('will_execute_instruction', insn)
+        self._publish('will_execute_instruction', self.PC, insn)
 
         # FIXME (theo) why just return here?
         if insn.address != self.PC:
             return
 
         name = self.canonicalize_instruction_name(insn)
-
-        def fallback_to_emulate(*operands):
-            text_bytes = ' '.join('%02x'%x for x in insn.bytes)
-            logger.info("Unimplemented instruction: 0x%016x:\t%s\t%s\t%s",
-                        insn.address, text_bytes, insn.mnemonic, insn.op_str)
-
-            self.publish('will_emulate_instruction', insn)
-            self.emulate(insn)
-            self.publish('did_emulate_instruction', insn)
-
-        implementation = getattr(self, name, fallback_to_emulate)
-
+            
         if logger.level == logging.DEBUG :
             logger.debug(self.render_instruction(insn))
             for l in self.render_registers():
                 register_logger.debug(l)
 
-        implementation(*insn.operands)
-        self._icount += 1
+        try:
+            try:
+                getattr(self, name)(*insn.operands)
+            except AttributeError:
+                text_bytes = ' '.join('%02x'%x for x in insn.bytes)
+                logger.info("Unimplemented instruction: 0x%016x:\t%s\t%s\t%s",
+                            insn.address, text_bytes, insn.mnemonic, insn.op_str)
+                self.emulate(insn)
+        except (Interruption, Syscall) as e:
+            e.on_handled = lambda: self._publish_instruction_as_executed(insn)
+            raise e
+        else:
+            self._publish_instruction_as_executed(insn)
 
-        self.publish('did_execute_instruction', insn)
+    #FIXME(yan): In the case the instruction implementation invokes a system call, we would not be able to
+    # publish the did_execute_instruction event from here, so we capture and attach it to the syscall
+    # exception for the platform to emit it for us once the syscall has successfully been executed.
+    def _publish_instruction_as_executed(self, insn):
+        '''
+        Notify listeners that an instruction has been executed.
+        '''
+        self._icount += 1
+        self._publish('did_execute_instruction', self._last_pc, self.PC, insn)
 
     def emulate(self, insn):
         '''
@@ -770,13 +854,19 @@ class Cpu(Eventful):
         '''
 
         emu = UnicornEmulator(self)
-        emu.emulate(insn)
-
-
-        # We have been seeing occasional Unicorn issues with it not clearing
-        # the backing unicorn instance. Saw fewer issues with the following
-        # line present.
-        del emu
+        try:
+            emu.emulate(insn)
+        except unicorn.UcError as e:
+            if e.errno == unicorn.UC_ERR_INSN_INVALID:
+                text_bytes = ' '.join('%02x'%x for x in insn.bytes)
+                logger.error("Unimplemented instruction: 0x%016x:\t%s\t%s\t%s",
+                  insn.address, text_bytes, insn.mnemonic, insn.op_str)
+            raise InstructionEmulationError(str(e))
+        finally:
+            # We have been seeing occasional Unicorn issues with it not clearing
+            # the backing unicorn instance. Saw fewer issues with the following
+            # line present.
+            del emu
 
     def render_instruction(self, insn=None):
         try:

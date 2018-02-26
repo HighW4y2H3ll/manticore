@@ -2,8 +2,9 @@ import os
 import copy
 import logging
 from collections import OrderedDict
+from weakref import WeakSet
 
-from .smtlib import solver, Bool
+from .smtlib import solver, Bool, ArrayProxy, Array
 from ..utils.helpers import issymbolic
 from ..utils.event import Eventful
 
@@ -12,7 +13,7 @@ from .cpu.abstractcpu import ConcretizeRegister
 from .memory import ConcretizeMemory, MemoryException
 from ..platforms.platform import *
 
-logger = logging.getLogger("STATE")
+logger = logging.getLogger(__name__)
 
 class StateException(Exception):
     ''' All state related exceptions '''
@@ -68,6 +69,8 @@ class State(Eventful):
     :ivar dict context: Local context for arbitrary data storage
     '''
 
+    _published_events = {'generate_testcase'}
+
     def __init__(self, constraints, platform, **kwargs):
         super(State, self).__init__(**kwargs)
         self._platform = platform
@@ -76,10 +79,12 @@ class State(Eventful):
         self._input_symbols = list()
         self._child = None
         self._context = dict()
-        self._init_context()
         ##################################################################33
         # Events are lost in serialization and fork !!
         self.forward_events_from(platform)
+        
+        #FIXME(felipe) This should go into some event callback in a plugin (start_run?)
+        self._init_context()
 
     def __getstate__(self):
         state = super(State, self).__getstate__()
@@ -101,11 +106,11 @@ class State(Eventful):
         # Events are lost in serialization and fork !!
         self.forward_events_from(self._platform)
 
-    #Fixme(felipe) change for with state.cow_copy() as st_temp:.
+    #Fixme(felipe) change for with "state.cow_copy() as st_temp":.
     def __enter__(self):
         assert self._child is None
         new_state = State(self._constraints.__enter__(), self._platform)
-        new_state._input_symbols = self._input_symbols
+        new_state._input_symbols = list(self._input_symbols)
         new_state._context = copy.deepcopy(self._context)
         self._child = new_state
 
@@ -143,8 +148,7 @@ class State(Eventful):
             raise TerminateState(e.message, testcase=True)
 
         #Remove when code gets stable?
-        assert self._platform._constraints is self._constraints
-        assert self.mem._constraints is self._constraints
+        assert self.platform.constraints is self.constraints
         return result
 
     @property
@@ -188,17 +192,17 @@ class State(Eventful):
         introduce it into the program state.
 
         :param int nbytes: Length of the new buffer
-        :param str name: (keyword arg only) The name to assign to the buffer
+        :param str label: (keyword arg only) The label to assign to the buffer
         :param bool cstring: (keyword arg only) Whether or not to enforce that the buffer is a cstring
-                 (i.e. no \0 bytes, except for the last byte). (bool)
+                 (i.e. no NULL bytes, except for the last byte). (bool)
         :param taint: Taint identifier of the new buffer
         :type taint: tuple or frozenset
 
         :return: :class:`~manticore.core.smtlib.expression.Expression` representing the buffer.
         '''
-        name = options.get('name', 'buffer')
+        label = options.get('label', 'buffer')
         taint = options.get('taint', frozenset())
-        expr = self._constraints.new_array(name=name, index_max=nbytes, taint=taint)
+        expr = self._constraints.new_array(name=label, index_max=nbytes, taint=taint)
         self._input_symbols.append(expr)
 
         if options.get('cstring', False):
@@ -230,7 +234,7 @@ class State(Eventful):
                 this is the identity function on the first argument.
         :param str label: The label to assign to the value
         :param str wildcard: The byte that is considered a wildcard
-        :param bool string: Ensure bytes returned can not be \0
+        :param bool string: Ensure bytes returned can not be NULL
         :param taint: Taint identifier of the symbolicated data
         :type taint: tuple or frozenset
 
@@ -260,10 +264,13 @@ class State(Eventful):
                     assert b != 0
         return data
 
-    def concretize(self, symbolic, policy, maxcount=100):
+    def concretize(self, symbolic, policy, maxcount=1000):
         ''' This finds a set of solutions for symbolic using policy.
             This raises TooManySolutions if more solutions than maxcount
         '''
+        assert self.constraints == self.platform.constraints
+
+
         vals = []
         if policy == 'MINMAX':
             vals = self._solver.minmax(self._constraints, symbolic)
@@ -290,6 +297,10 @@ class State(Eventful):
         from .smtlib import solver
         return solver
 
+
+    def can_be_true(self, expr):
+        return self._solver.can_be_true(self._constraints, expr)
+
     def solve_one(self, expr):
         '''
         Concretize a symbolic :class:`~manticore.core.smtlib.expression.Expression` into
@@ -301,7 +312,7 @@ class State(Eventful):
         '''
         return self._solver.get_value(self._constraints, expr)
 
-    def solve_n(self, expr, nsolves, policy='minmax'):
+    def solve_n(self, expr, nsolves):
         '''
         Concretize a symbolic :class:`~manticore.core.smtlib.expression.Expression` into
         `nsolves` solutions.
@@ -374,4 +385,4 @@ class State(Eventful):
         :param str name: Short string identifying this testcase used to prefix workspace entries.
         :param str message: Longer description
         """
-        self.publish('will_generate_testcase', name, message)
+        self._publish('will_generate_testcase', name, message)
